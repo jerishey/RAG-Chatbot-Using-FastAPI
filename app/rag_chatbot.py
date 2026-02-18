@@ -96,6 +96,11 @@ class RAGChatbot:
 
     def _init_llm(self, api_key: str):
         """Initialize the LLM based on provider."""
+        if not api_key:
+            api_key = os.getenv(f"{self.llm_provider.upper()}_API_KEY")
+            if not api_key:
+                raise ValueError(f"API key for {self.llm_provider} not provided and not found in environment variables.")
+            
         if self.llm_provider == "openai":
             import openai
             self.llm_client = openai.OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
@@ -270,6 +275,61 @@ class RAGChatbot:
             "source": source,
             "collection_size": self.collection.count()
         }
+    
+    """TEXT FILE PROCESSING"""
+    def process_text_file(self, text_file_path: str) -> Dict:
+        """
+        Complete pipeline for text files: Read → Chunk → Embed → Store
+
+        Args:
+            text_file_path: Path to the text file
+
+        Returns:
+            Dictionary with processing statistics
+        """
+        print(f"\nProcessing text file: {text_file_path}")
+
+        # Step 1: Read text from file
+        text = self._extract_text_from_file(text_file_path)
+        print(f"Read {len(text)} characters")
+
+        # Step 2: Chunk the text
+        chunks = self._chunk_text(text)
+        print(f"Created {len(chunks)} chunks")
+
+        # Apply max_chunks limit
+        if len(chunks) > self.max_chunks:
+            print(f"Warning: Limiting chunks to {self.max_chunks} for performance (file has {len(chunks)} chunks).")
+            chunks = chunks[:self.max_chunks]
+
+        # Step 3: Generate embeddings
+        embeddings = self._generate_embeddings(chunks)
+        print(f"Generated {len(embeddings)} embeddings")
+
+        # Step 4: Store in ChromaDB
+        source = Path(text_file_path).name
+        stats = self._store_in_vectordb(chunks, embeddings, source)
+        print("Stored in vector database")
+
+        return stats
+    def _extract_text_from_file(self, file_path: str) -> str:
+        """Extract text from a text file"""
+        try:
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"Text file not found: {file_path}")
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            
+            if not text.strip():
+                raise ValueError(f"No text found in file: {file_path}")
+
+            return text
+        except UnicodeDecodeError:
+            raise RuntimeError(f"Error reading text file {file_path}: Unsupported encoding (try UTF-8)")
+        except Exception as e:
+            raise RuntimeError(f"Error processing text file {file_path}: {str(e)}")
+        
     # QUERY PIPELINE
     def query(self, question: str, return_sources: bool = True) -> Dict:
         """
@@ -516,36 +576,44 @@ def main():
     print("=" * 70)
 
     # Auto-detect PDFs in uploads/pdf folder
-    uploads_dir = Path("../uploads/pdf")
-    
-    if uploads_dir.exists():
-        pdf_files = list(uploads_dir.glob("*.pdf"))
-        
-        if pdf_files:
-            print(f"\n📚 Found {len(pdf_files)} PDF(s) in uploads/pdf folder:")
-            for i, pdf in enumerate(pdf_files, 1):
-                print(f"   {i}. {pdf.name}")
-            
-            choice = input("\n📁 Enter number to select, or enter custom path: ").strip()
-            
-            # Check if user entered a number
-            if choice.isdigit() and 1 <= int(choice) <= len(pdf_files):
-                pdf_path = str(pdf_files[int(choice) - 1])
-            else:
-                pdf_path = choice
-        else:
-            pdf_path = input("\n📁 Enter the path to your PDF file: ").strip()
-    else:
-        pdf_path = input("\n📁 Enter the path to your PDF file: ").strip()
+    pdf_dir = Path("./uploads/pdf")
+    text_dir = Path("./uploads/text")
 
-    if not os.path.exists(pdf_path):
-        print(f"❌ Error: File '{pdf_path}' not found!")
+    pdf_files = list(pdf_dir.glob("*.pdf")) if pdf_dir.exists() else []
+    text_files = list(text_dir.glob("*.txt")) if text_dir.exists() else []
+    all_files = pdf_files + text_files
+    
+    if all_files:
+        print(f"\n Found {len(all_files)} file(s):")
+        for i, file_path in enumerate(all_files, 1):
+            file_type = "PDF" if file_path.suffix.lower() == ".pdf" else "Text"
+            print(f"   {i}. [{file_type}] {file_path.name}")
+        
+        choice = input("\n Enter number to select, or enter custom path: ").strip()
+        
+        # Check if user entered a number
+        if choice.isdigit() and 1 <= int(choice) <= len(all_files):
+            selected_file = all_files[int(choice) - 1]
+            file_path = str(selected_file)
+            is_pdf = selected_file.suffix.lower() == ".pdf"
+        else:
+            file_path = choice
+            is_pdf = file_path.lower().endswith(".pdf")
+    else:
+        file_path = input("\n Enter the path to your PDF or text file: ").strip()
+        is_pdf = file_path.lower().endswith(".pdf")
+
+    if not os.path.exists(file_path):
+        print(f" Error: File '{file_path}' not found!")
         return
 
-    # Process the PDF
-    stats = chatbot.process_pdf(pdf_path)
+    # Process the file
+    if is_pdf:
+        stats = chatbot.process_pdf(file_path)
+    else:
+        stats = chatbot.process_text_file(file_path)
 
-    print(f"\n📊 Processing Statistics:")
+    print(f"\n Processing Statistics:")
     print(f"   - Total chunks created: {stats['total_chunks']}")
     print(f"   - Total documents in DB: {stats['collection_size']}")
 
@@ -553,11 +621,11 @@ def main():
     print("\n" + "=" * 70)
     print("PHASE 2: QUESTION ANSWERING")
     print("=" * 70)
-    print("\n💡 You can now ask questions about the PDF!")
+    print("\n You can now ask questions about the PDF/text file!")
     print("   Type 'quit' to exit, 'stats' for database info, 'reset' to clear DB\n")
 
     while True:
-        question = input("🤔 Your question: ").strip()
+        question = input(" Your question: ").strip()
 
         if not question:
             print("Please enter a question.")
@@ -568,17 +636,17 @@ def main():
             continue
 
         if question.lower() == 'quit':
-            print("\n👋 Goodbye!")
+            print("\n Goodbye!")
             break
 
         if question.lower() == 'stats':
             stats = chatbot.get_stats()
-            print(f"\n📊 Database Stats: {stats}\n")
+            print(f"\n Database Stats: {stats}\n")
             continue
 
         if question.lower() == 'reset':
             chatbot.reset_database()
-            print("💾 Database has been reset. Please upload a PDF again.\n")
+            print(" Database has been reset. Please upload a PDF/text file again.\n")
             continue
 
         try:
@@ -587,12 +655,12 @@ def main():
 
             # Display answer
             print("\n" + "=" * 70)
-            print("🤖 ANSWER:")
+            print("ANSWER:")
             print("=" * 70)
             print(result["answer"])
 
             # Display sources
-            print("\n📚 SOURCES:")
+            print("\nSOURCES:")
             for i, source in enumerate(result["sources"], 1):
                 print(f"\n[Source {i}] (Score: {source['score']:.4f})")
                 print(f"   {source['text'][:200]}...")
@@ -600,7 +668,7 @@ def main():
             print("\n" + "=" * 70 + "\n")
 
         except Exception as e:
-            print(f"\n❌ Error: {str(e)}\n")
+            print(f"\nError: {str(e)}\n")
 
 
 if __name__ == "__main__":
