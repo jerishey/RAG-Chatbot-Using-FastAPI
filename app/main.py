@@ -31,7 +31,7 @@ CHATBOT_CONFIG = {
 
 # File upload constraints
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024))  # 10MB default
-ALLOWED_EXTENSIONS = {'.pdf'}
+ALLOWED_EXTENSIONS = {'.pdf', '.txt'}
 
 # CORS origins (should be set in production)
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -42,8 +42,13 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 chatbot: Optional[RAGChatbot] = None
 
 # Directory for uploaded PDFs
-UPLOAD_DIR = Path("../uploads/pdf")
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads/pdf"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Directory for uploaded text files
+TEXT_UPLOAD_DIR = Path(os.getenv("TEXT_UPLOAD_DIR", "./uploads/text"))
+TEXT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # ==================== LIFESPAN MANAGEMENT ====================
 
@@ -74,11 +79,11 @@ async def lifespan(app: FastAPI):
         chatbot = RAGChatbot(
             llm_provider=provider,
             api_key=api_key,
-            chunk_size=500,
-            chunk_overlap=50,
-            top_k=10,
-            top_n=3,
-            max_chunks=1000
+            chunk_size=CHATBOT_CONFIG["chunk_size"],
+            chunk_overlap=CHATBOT_CONFIG["chunk_overlap"],
+            top_k=CHATBOT_CONFIG["top_k"],
+            top_n=CHATBOT_CONFIG["top_n"],
+            max_chunks=CHATBOT_CONFIG["max_chunks"]
         )
 
     except Exception as e:
@@ -130,8 +135,8 @@ class QueryResponse(BaseModel):
     num_sources: int
     sources: Optional[List[Dict]] = None
 
-class ProcessPDFResponse(BaseModel):
-    """Response model for PDF processing"""
+class ProcessFileResponse(BaseModel):
+    """Response model for file processing"""
     message: str
     total_chunks: int
     source: str
@@ -162,17 +167,6 @@ class ResetResponse(BaseModel):
     message: str
     total_chunks: int
 
-class ChatbotConfig(BaseModel):
-    """Configuration model for chatbot initialization"""
-    embedding_model: str = "all-MiniLM-L6-v2"
-    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    llm_provider: str = "anthropic"
-    chunk_size: int = Field(default=500, ge=100, le=2000, description="Chunk size for text splitting")
-    chunk_overlap: int = Field(default=50, ge=0, le=500, description="Overlap between chunks")
-    max_chunks: int = Field(default=1000, ge=100, le=10000, description="Maximum chunks to store")
-    top_k: int = Field(default=10, ge=1, le=100, description="Number of chunks to retrieve")
-    top_n: int = Field(default=3, ge=1, le=20, description="Number of chunks after reranking")
-
 # ==================== ENDPOINTS ====================
 
 @app.get("/")
@@ -183,27 +177,29 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "POST /upload": "Upload and process a PDF file",
-            "POST /query": "Ask a question about uploaded PDFs",
+            "POST /upload-text": "Upload and process a text file (.txt)",
+            "POST /query": "Ask a question about uploaded files",
             "GET /stats": "Get database statistics",
             "GET /documents": "List all uploaded documents",
             "POST /reset": "Reset the database",
             "GET /health": "Health check",
-            "POST /process-local-pdf": "Process a PDF from local filesystem"
+            "POST /process-local-pdf": "Process a PDF from local filesystem",
+            "POST /process-local-text": "Process a text file from local filesystem"
         }
     }
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
     if chatbot is None:
-        raise HTTPException(status_code=503, detail="Chatbot not initialized")
-    
-    return {
-        "status": "healthy",
-        "chatbot_initialized": chatbot is not None
-    }
+        return HealthResponse(status="unhealthy", chatbot_initialized=False, database_accessible=False)
+    try:
+        stats = chatbot.get_stats()
+        return HealthResponse(status="healthy", chatbot_initialized=True, database_accessible=True)
+    except Exception:
+        return HealthResponse(status="healthy", chatbot_initialized=True, database_accessible=False)
 
-@app.post("/upload", response_model=ProcessPDFResponse)
+@app.post("/upload", response_model=ProcessFileResponse)
 async def upload_pdf(file: UploadFile = File(...)):
     """
     Upload and process a PDF file
@@ -234,7 +230,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         saved_path = UPLOAD_DIR / file.filename
         shutil.copy(temp_path, saved_path)
         
-        return ProcessPDFResponse(
+        return ProcessFileResponse(
             message=f"Successfully processed {file.filename}",
             total_chunks=stats["total_chunks"],
             source=stats["source"],
@@ -243,6 +239,62 @@ async def upload_pdf(file: UploadFile = File(...)):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+    finally:
+        # Clean up temp file
+        if file.file:
+            file.file.close()
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception as e:
+                print(f"Failed to cleanup temp file: {str(e)}")
+
+@app.post("/upload-text", response_model=ProcessFileResponse)
+async def upload_text_file(file: UploadFile = File(...)):
+    """
+    Upload and process a text file (.txt)
+    
+    - **file**: Text file to upload and process
+    """
+    if chatbot is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+    
+    # Validate file type
+    if not file.filename.lower().endswith(".txt"):
+        raise HTTPException(status_code=400, detail="Only .txt files are allowed")
+    
+    temp_path = None
+    saved_path = None
+    
+    try:
+        # Read file size
+        file_size = len(await file.read())
+        await file.seek(0)  # Reset file pointer
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(status_code=413, detail=f"File too large. Max size: {MAX_FILE_SIZE} bytes")
+        
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.txt') as temp_file:
+            # Copy uploaded file to temp file
+            shutil.copyfileobj(file.file, temp_file)
+            temp_path = temp_file.name
+        
+        # Process the text file
+        stats = chatbot.process_text_file(temp_path)
+        
+        # Save to text upload directory
+        saved_path = TEXT_UPLOAD_DIR / file.filename
+        shutil.copy(temp_path, saved_path)
+        
+        return ProcessFileResponse(
+            message=f"Successfully processed {file.filename}",
+            total_chunks=stats["total_chunks"],
+            source=stats["source"],
+            collection_size=stats["collection_size"]
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing text file: {str(e)}")
     finally:
         # Clean up temp file
         if file.file:
@@ -356,7 +408,7 @@ async def process_local_pdf(pdf_path: str = Query(..., description="Path to loca
     try:
         stats = chatbot.process_pdf(pdf_path)
         
-        return ProcessPDFResponse(
+        return ProcessFileResponse(
             message=f"Successfully processed {Path(pdf_path).name}",
             total_chunks=stats["total_chunks"],
             source=stats["source"],
@@ -365,6 +417,33 @@ async def process_local_pdf(pdf_path: str = Query(..., description="Path to loca
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+    
+@app.post("/process-local-text")
+async def process_local_text(text_path: str = Query(..., description="Path to local text file")):
+    """
+    Process a text file from local filesystem
+    
+    - **text_path**: Path to the text file on the server
+    """
+    if chatbot is None:
+        raise HTTPException(status_code=503, detail="Chatbot not initialized")
+    
+    if not os.path.exists(text_path):
+        raise HTTPException(status_code=404, detail=f"Text file not found: {text_path}")
+    
+    try:
+        stats = chatbot.process_text_file(text_path)
+        
+        return ProcessFileResponse(
+            message=f"Successfully processed {Path(text_path).name}",
+            total_chunks=stats["total_chunks"],
+            source=stats["source"],
+            collection_size=stats["collection_size"]
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing text file: {str(e)}")
+
 
 # ==================== RUN SERVER ====================
 
